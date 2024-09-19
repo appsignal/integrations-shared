@@ -1,0 +1,103 @@
+name: "Update agent release files"
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: "Version"
+        required: true
+        type: string
+      user:
+        description: "User who triggered the release"
+        required: true
+        type: string
+      files:
+        description: "Files to update"
+        required: true
+        type: string
+    secrets:
+      PUBLISH_INTEGRATION_DEPLOY_KEY:
+        description: "Integration repository deploy key"
+        required: true
+      PUBLISH_GIT_SIGN_KEY:
+        description: "Private key to sign commits"
+        required: true
+      PUBLISH_GIT_SIGN_PUBLIC_KEY:
+        description: "Public key to sign commits"
+        required: true
+      PUBLISH_AGENT_INTEGRATIONS_RELEASE_PAT:
+        description: "GitHub Personal Access Token to create Pull Requests"
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  PUBLISH_GIT_USERNAME: "AppSignal release bot"
+  PUBLISH_GIT_EMAIL: "support+build-sign@appsignal.com"
+  PUBLISH_GIT_SSH_PATH: "/home/runner/.ssh"
+  PUBLISH_GIT_SIGN_KEY_PATH: "/home/runner/.ssh/sign_key"
+
+jobs:
+  release:
+    name: "Update agent release files"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ssh-key: ${{secrets.PUBLISH_INTEGRATION_DEPLOY_KEY}}
+
+      - name: Configure Git
+        run: |
+          mkdir -p "$PUBLISH_GIT_SSH_PATH"
+          echo "${{secrets.PUBLISH_GIT_SIGN_KEY}}" > "$PUBLISH_GIT_SIGN_KEY_PATH"
+          echo "${{secrets.PUBLISH_GIT_SIGN_PUBLIC_KEY}}" > "$PUBLISH_GIT_SIGN_KEY_PATH.pub"
+          chmod 600 "$PUBLISH_GIT_SIGN_KEY_PATH"
+          git config --global user.name "$PUBLISH_GIT_USERNAME (as ${{inputs.user}})"
+          git config --global user.email "$PUBLISH_GIT_EMAIL"
+          git config --global gpg.format ssh
+          git config --global commit.gpgsign true
+          touch ~/.ssh/allowed_signers
+          echo "$(git config --get user.email) namespaces=\"git\" $(cat $PUBLISH_GIT_SIGN_KEY_PATH.pub)" >> ~/.ssh/allowed_signers
+          git config --global user.signingkey "$PUBLISH_GIT_SIGN_KEY_PATH"
+
+      - name: Create release branch name
+        id: branch
+        run: |
+          echo "RELEASE_BRANCH=update-agent/${{inputs.version}}" >> "$GITHUB_OUTPUT"
+
+      - name: Create release branch
+        run: git checkout -b "${{steps.branch.outputs.RELEASE_BRANCH}}"
+
+      - name: Update release files
+        run: |
+          ruby \
+            -r "json"\
+            -e 'JSON.parse(ENV.fetch("UPDATED_FILES")).each { |(file, contents)| File.write(file, "#{contents.strip}\n") }'
+        env:
+          UPDATED_FILES: "${{inputs.files}}"
+
+      - name: Commit release
+        run: |
+          git add .
+          git commit \
+            --gpg-sign \
+            --message "Update agent to version ${{inputs.version}}" \
+            --message "The agent update and changesets are updated automatically." \
+            --message "[skip review]"
+
+      - name: Push release branch
+        run: git push origin "${{steps.branch.outputs.RELEASE_BRANCH}}"
+
+      - name: Create Pull Request
+        run: |
+          gh pr create \
+            --head "${{steps.branch.outputs.RELEASE_BRANCH}}" \
+            --assignee ${{inputs.user}} \
+            --reviewer ${{inputs.user}} \
+            --label "enhancement" \
+            --fill-verbose
+        env:
+          GH_TOKEN: ${{secrets.PUBLISH_AGENT_INTEGRATIONS_RELEASE_PAT}}
